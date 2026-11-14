@@ -27,11 +27,10 @@ type BomRow struct {
 	ColB string
 	ColC string
 	ColD string
-	ColE string // 数量文本
+	ColE string
 	ColF string
 }
 
-// 把数量字符串转float，失败返回0
 func parseQty(s string) float64 {
 	s = strings.TrimSpace(s)
 	f, err := strconv.ParseFloat(s, 64)
@@ -59,7 +58,6 @@ func readBOM(path string) ([]BomRow, error) {
 	}
 
 	var list []BomRow
-	// 跳过表头第1行，从第2行开始读数据
 	for i := 1; i < len(rows); i++ {
 		r := rows[i]
 		a := getCell(r, 0)
@@ -132,7 +130,6 @@ func main() {
 	name1 := filepath.Base(file1)
 	name2 := filepath.Base(file2)
 
-	// 构建BOM2：料号 -> 行列表，标记是否已匹配
 	type wrap struct {
 		used bool
 		row  BomRow
@@ -143,15 +140,14 @@ func main() {
 		map2[pn] = append(map2[pn], &wrap{used: false, row: r})
 	}
 
-	var only1NoMatch []BomRow   // BOM1料号完全在BOM2找不到
-	var only2NoMatch []BomRow   // BOM2剩余没匹配
+	var only1NoMatch []BomRow
+	var only2NoMatch []BomRow
 	type pair struct {
 		r1 BomRow
 		r2 BomRow
 	}
 	var commonPairs []pair
 
-	// 第一步：匹配料号相同的行
 	for _, r1 := range list1 {
 		pn1 := strings.TrimSpace(r1.ColA)
 		arr, ok := map2[pn1]
@@ -175,7 +171,6 @@ func main() {
 		commonPairs = append(commonPairs, pair{r1, item.row})
 	}
 
-	// 收集BOM2里面剩下没匹配的
 	for _, arr := range map2 {
 		for _, w := range arr {
 			if !w.used {
@@ -184,7 +179,6 @@ func main() {
 		}
 	}
 
-	// 先预存三类行数据，分开存放，保证顺序不乱
 	type WriteRowData struct {
 		r1  BomRow
 		r2  BomRow
@@ -194,7 +188,6 @@ func main() {
 	var bom1ExtraList []WriteRowData
 	var bom2ExtraList []WriteRowData
 
-	// 处理配对：生成共有行，差值行先暂存，不立刻写表
 	for _, p := range commonPairs {
 		r1 := p.r1
 		r2 := p.r2
@@ -222,7 +215,6 @@ func main() {
 		}
 	}
 
-	// 把【料号完全找不到匹配】的特有行追加到对应列表尾部
 	for _, r := range only1NoMatch {
 		bom1ExtraList = append(bom1ExtraList, WriteRowData{r, BomRow{}, "第1个BOM特有物料"})
 	}
@@ -230,7 +222,6 @@ func main() {
 		bom2ExtraList = append(bom2ExtraList, WriteRowData{BomRow{}, r, "第2个BOM特有物料"})
 	}
 
-	// 开始写入Excel
 	outName := "对比结果.xlsx"
 	_ = os.Remove(outName)
 	f := excelize.NewFile()
@@ -247,17 +238,14 @@ func main() {
 	}
 
 	row := 3
-	// 1. 先全部写共有物料
 	for _, d := range commonList {
 		writeRow(f, sheet, row, d.r1, d.r2, d.typ)
 		row++
 	}
-	// 2. 再全部写第1个BOM特有物料（包含数量差值产生的 + 料号完全不匹配的）
 	for _, d := range bom1ExtraList {
 		writeRow(f, sheet, row, d.r1, d.r2, d.typ)
 		row++
 	}
-	// 3. 最后全部写第2个BOM特有物料（包含数量差值产生的 + 料号完全不匹配的）
 	for _, d := range bom2ExtraList {
 		writeRow(f, sheet, row, d.r1, d.r2, d.typ)
 		row++
@@ -265,9 +253,7 @@ func main() {
 
 	if err := f.SaveAs(outName); err != nil {
 		fmt.Printf("保存对比结果.xlsx失败，请关闭打开的Excel！err:%v\n", err)
-		fmt.Print("按回车键退出...")
-		_, _ = os.Stdin.Read(make([]byte, 1))
-		'os.Exit(1)
+		os.Exit(1)
 	}
 
 	fmt.Println("已经对比完成，对比结果请查收当前文件夹中的对比结果.xlsx")
