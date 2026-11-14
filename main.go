@@ -387,7 +387,15 @@ func main() {
 		writeRowNew(f, sheet, row, d.r1, d.r2, d.typ)
 		row++
 	}
-
+// 👇 新增：冻结前两行
+	if err := f.SetPanes(sheet, &excelize.Panes{
+		Freeze:      true,
+		YSplit:      2,
+		TopLeftCell: "A3",
+		ActivePane:  "bottomLeft",
+	}); err != nil {
+		fmt.Printf("设置冻结窗格失败（不影响结果文件）：%v\n", err)
+	}
 	if err := f.SaveAs(outName); err != nil {
 		fmt.Printf("保存对比结果.xlsx失败，请关闭打开的Excel！err:%v\n", err)
 		waitEnter()
