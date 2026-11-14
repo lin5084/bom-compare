@@ -103,16 +103,23 @@ func readBOM(path string) ([]BomRow, error) {
 	if err != nil {
 		return nil, err
 	}
-	// key: 行号（从0开始）, value:true 代表这一行属于某个合并区域，但不是首行，需要跳过
+	// key: 程序内行号（从0开始）, value:true 代表这一行属于某个合并区域，但不是首行，需要跳过
 	skipRow := make(map[int]bool)
 	for _, mr := range mergeRanges {
-		area := mr.GetStartAxis() + ":" + mr.GetEndAxis()
-		rect, err := excelize.AreaRefToCoordinates(area)
+		startAxis := mr.GetStartAxis()
+		endAxis := mr.GetEndAxis()
+
+		// 解析左上角单元格
+		sC, sR, err := excelize.CellNameToCoordinates(startAxis)
 		if err != nil {
 			continue
 		}
-		sC, sR, eC, eR := rect[0], rect[1], rect[2], rect[3]
-		// Excel坐标是从1开始，转为程序内0基
+		// 解析右下角单元格
+		eC, eR, err := excelize.CellNameToCoordinates(endAxis)
+		if err != nil {
+			continue
+		}
+
 		// 判断这个合并区域是否包含E(5)或者F(6)列
 		hasE := (sC <= 5 && eC >= 5)
 		hasF := (sC <= 6 && eC >= 6)
