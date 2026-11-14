@@ -6,7 +6,6 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -107,22 +106,23 @@ func readBOM(path string) ([]BomRow, error) {
 	// key: 行号（从0开始）, value:true 代表这一行属于某个合并区域，但不是首行，需要跳过
 	skipRow := make(map[int]bool)
 	for _, mr := range mergeRanges {
-		startCol, startRow, endCol, endRow, err := excelize.CellNameToCoordinates(mr)
+		area := mr.GetStartAxis() + ":" + mr.GetEndAxis()
+		rect, err := excelize.AreaRefToCoordinates(area)
 		if err != nil {
 			continue
 		}
+		sC, sR, eC, eR := rect[0], rect[1], rect[2], rect[3]
 		// Excel坐标是从1开始，转为程序内0基
-		sR := startRow - 1
-		eR := endRow - 1
-		sC := startCol
-		eC := endCol
 		// 判断这个合并区域是否包含E(5)或者F(6)列
 		hasE := (sC <= 5 && eC >= 5)
 		hasF := (sC <= 6 && eC >= 6)
 		if hasE || hasF {
 			// 合并区内，除首行外全部标记跳过
-			for r := sR + 1; r <= eR; r++ {
-				skipRow[r] = true
+			for r := sR; r <= eR; r++ {
+				if r == sR {
+					continue
+				}
+				skipRow[r-1] = true
 			}
 		}
 	}
@@ -169,9 +169,6 @@ func sortGroup(list []WriteRowData) []WriteRowData {
 	hasPrice := make([]WriteRowData, 0)
 	noPrice := make([]WriteRowData, 0)
 	for _, d := range list {
-		// 判断规则：只要r1料号查到 或者 r2料号查到，不算无价格？
-		// 需求：该行【对应的】料号查不到就标记无价格
-		// 共有物料：看r1料号；BOM1特有：r1料号；BOM2特有：r2料号
 		no := false
 		switch d.typ {
 		case "共有物料", "第1个BOM特有物料":
