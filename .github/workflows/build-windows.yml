@@ -1,0 +1,42 @@
+name: build-bom-compare
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: 编译 exe（amd64）
+        run: go build -trimpath -ldflags "-s -w" -o bom-compare.exe .
+
+      - name: 验证产物
+        run: |
+          if (!(Test-Path .\bom-compare.exe)) { throw "bom-compare.exe 未生成" }
+          Get-Item .\bom-compare.exe | Select-Object Name, Length
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: bom-compare-windows-amd64
+          path: bom-compare.exe
+          if-no-files-found: error
+
+      - name: 发布 Release（仅打 tag 时）
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: bom-compare.exe
+          generate_release_notes: true
