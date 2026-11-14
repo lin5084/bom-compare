@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"math"
 	"os"
@@ -110,6 +111,7 @@ func main() {
 		})
 		if len(xlsxFiles) < 2 {
 			fmt.Println("错误：当前目录需要至少2个xlsx BOM文件，或者手动传入参数 bom-compare.exe 1.xlsx 2.xlsx")
+			waitEnter()
 			os.Exit(1)
 		}
 		file1 = xlsxFiles[0]
@@ -119,11 +121,13 @@ func main() {
 	list1, err := readBOM(file1)
 	if err != nil {
 		fmt.Printf("读取%s失败：%v\n", file1, err)
+		waitEnter()
 		os.Exit(1)
 	}
 	list2, err := readBOM(file2)
 	if err != nil {
 		fmt.Printf("读取%s失败：%v\n", file2, err)
+		waitEnter()
 		os.Exit(1)
 	}
 
@@ -253,12 +257,18 @@ func main() {
 
 	if err := f.SaveAs(outName); err != nil {
 		fmt.Printf("保存对比结果.xlsx失败，请关闭打开的Excel！err:%v\n", err)
+		waitEnter()
 		os.Exit(1)
 	}
 
 	fmt.Println("已经对比完成，对比结果请查收当前文件夹中的对比结果.xlsx")
-	fmt.Print("按回车键退出...")
-	_, _ = os.Stdin.Read(make([]byte, 1))
+	waitEnter()
+}
+
+func waitEnter() {
+	fmt.Println("按回车键退出...")
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Scan()
 }
 
 func writeRow(f *excelize.File, sheet string, row int, r1, r2 BomRow, typ string) {
