@@ -143,8 +143,8 @@ func main() {
 		map2[pn] = append(map2[pn], &wrap{used: false, row: r})
 	}
 
-	var only1 []BomRow   // BOM1 料号在BOM2找不到
-	var only2 []BomRow   // BOM2 剩余没匹配的
+	var only1NoMatch []BomRow   // BOM1料号完全在BOM2找不到
+	var only2NoMatch []BomRow   // BOM2剩余没匹配
 	type pair struct {
 		r1 BomRow
 		r2 BomRow
@@ -156,11 +156,9 @@ func main() {
 		pn1 := strings.TrimSpace(r1.ColA)
 		arr, ok := map2[pn1]
 		if !ok {
-			// 料号不存在，归入BOM1特有
-			only1 = append(only1, r1)
+			only1NoMatch = append(only1NoMatch, r1)
 			continue
 		}
-		// 找到第一个未使用的同料号行
 		foundIdx := -1
 		for i, item := range arr {
 			if !item.used {
@@ -169,7 +167,7 @@ func main() {
 			}
 		}
 		if foundIdx == -1 {
-			only1 = append(only1, r1)
+			only1NoMatch = append(only1NoMatch, r1)
 			continue
 		}
 		item := arr[foundIdx]
@@ -181,11 +179,58 @@ func main() {
 	for _, arr := range map2 {
 		for _, w := range arr {
 			if !w.used {
-				only2 = append(only2, w.row)
+				only2NoMatch = append(only2NoMatch, w.row)
 			}
 		}
 	}
 
+	// 先预存三类行数据，分开存放，保证顺序不乱
+	type WriteRowData struct {
+		r1  BomRow
+		r2  BomRow
+		typ string
+	}
+	var commonList []WriteRowData
+	var bom1ExtraList []WriteRowData
+	var bom2ExtraList []WriteRowData
+
+	// 处理配对：生成共有行，差值行先暂存，不立刻写表
+	for _, p := range commonPairs {
+		r1 := p.r1
+		r2 := p.r2
+		q1 := parseQty(r1.ColE)
+		q2 := parseQty(r2.ColE)
+		minQty := math.Min(q1, q2)
+		diff := math.Abs(q1 - q2)
+
+		sharedR1 := r1
+		sharedR1.ColE = fmt.Sprintf("%g", minQty)
+		sharedR2 := r2
+		sharedR2.ColE = fmt.Sprintf("%g", minQty)
+		commonList = append(commonList, WriteRowData{sharedR1, sharedR2, "共有物料"})
+
+		if diff > 1e-9 {
+			if q1 > q2 {
+				diffRow := r1
+				diffRow.ColE = fmt.Sprintf("%g", diff)
+				bom1ExtraList = append(bom1ExtraList, WriteRowData{diffRow, BomRow{}, "第1个BOM特有物料"})
+			} else {
+				diffRow := r2
+				diffRow.ColE = fmt.Sprintf("%g", diff)
+				bom2ExtraList = append(bom2ExtraList, WriteRowData{BomRow{}, diffRow, "第2个BOM特有物料"})
+			}
+		}
+	}
+
+	// 把【料号完全找不到匹配】的特有行追加到对应列表尾部
+	for _, r := range only1NoMatch {
+		bom1ExtraList = append(bom1ExtraList, WriteRowData{r, BomRow{}, "第1个BOM特有物料"})
+	}
+	for _, r := range only2NoMatch {
+		bom2ExtraList = append(bom2ExtraList, WriteRowData{BomRow{}, r, "第2个BOM特有物料"})
+	}
+
+	// 开始写入Excel
 	outName := "对比结果.xlsx"
 	_ = os.Remove(outName)
 	f := excelize.NewFile()
@@ -202,58 +247,29 @@ func main() {
 	}
 
 	row := 3
-	// 处理【料号相同】的配对：生成共有行 + 差值特有行
-	for _, p := range commonPairs {
-		r1 := p.r1
-		r2 := p.r2
-		q1 := parseQty(r1.ColE)
-		q2 := parseQty(r2.ColE)
-		minQty := math.Min(q1, q2)
-		diff := math.Abs(q1 - q2)
-
-		// 共有物料行：数量改为minQty
-		sharedR1 := r1
-		sharedR1.ColE = fmt.Sprintf("%g", minQty)
-		sharedR2 := r2
-		sharedR2.ColE = fmt.Sprintf("%g", minQty)
-		writeRow(f, sheet, row, sharedR1, sharedR2, "共有物料")
-		row++
-
-		// 存在差值，追加差异行
-		if diff > 1e-9 {
-			if q1 > q2 {
-				// BOM1多出来的数量，追加到BOM1特有
-				diffRow := r1
-				diffRow.ColE = fmt.Sprintf("%g", diff)
-				writeRow(f, sheet, row, diffRow, BomRow{}, "第1个BOM特有物料")
-				row++
-			} else {
-				// BOM2多出来的数量，追加到BOM2特有
-				diffRow := r2
-				diffRow.ColE = fmt.Sprintf("%g", diff)
-				writeRow(f, sheet, row, BomRow{}, diffRow, "第2个BOM特有物料")
-				row++
-			}
-		}
-	}
-
-	// 写入BOM1完全找不到对应料号的行
-	for _, r := range only1 {
-		writeRow(f, sheet, row, r, BomRow{}, "第1个BOM特有物料")
+	// 1. 先全部写共有物料
+	for _, d := range commonList {
+		writeRow(f, sheet, row, d.r1, d.r2, d.typ)
 		row++
 	}
-	// 写入BOM2完全找不到对应料号的行
-	for _, r := range only2 {
-		writeRow(f, sheet, row, BomRow{}, r, "第2个BOM特有物料")
+	// 2. 再全部写第1个BOM特有物料（包含数量差值产生的 + 料号完全不匹配的）
+	for _, d := range bom1ExtraList {
+		writeRow(f, sheet, row, d.r1, d.r2, d.typ)
+		row++
+	}
+	// 3. 最后全部写第2个BOM特有物料（包含数量差值产生的 + 料号完全不匹配的）
+	for _, d := range bom2ExtraList {
+		writeRow(f, sheet, row, d.r1, d.r2, d.typ)
 		row++
 	}
 
 	if err := f.SaveAs(outName); err != nil {
 		fmt.Printf("保存对比结果.xlsx失败，请关闭打开的Excel！err:%v\n", err)
-		os.Exit(1)
+		fmt.Print("按回车键退出...")
+		_, _ = os.Stdin.Read(make([]byte, 1))
+		'os.Exit(1)
 	}
 
-	// 固定输出文字
 	fmt.Println("已经对比完成，对比结果请查收当前文件夹中的对比结果.xlsx")
 }
 
