@@ -7,279 +7,224 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/xuri/excelize/v2"
 )
 
-const (
-	outputName = "对比结果.xlsx"
-	colCount   = 6 // A~F
-	firstCell  = 3 // 起始数据行（第 1 行放文件名、第 2 行放表头）
+var (
+	kernel32               = syscall.NewLazyDLL("kernel32.dll")
+	procSetConsoleOutputCP = kernel32.NewProc("SetConsoleOutputCP")
 )
 
-// bomRow 表示 BOM 中的一行，固定保存 A~F 六列的值。
-type bomRow struct {
-	cells [colCount]string
+func enableUTF8Console() {
+	const CP_UTF8 = 65001
+	procSetConsoleOutputCP.Call(uintptr(CP_UTF8))
 }
 
-func (r bomRow) isEmpty() bool {
-	for _, v := range r.cells {
-		if strings.TrimSpace(v) != "" {
-			return false
-		}
-	}
-	return true
+type BomRow struct {
+	ColA string
+	ColB string
+	ColC string
+	ColD string
+	ColE string // 数量
+	ColF string
+	Key  string // A料号+E数量 作为匹配key
 }
 
-// normQty 归一化数量：能解析成数字时按数值比较（1 与 1.0、01 视为相同），否则按去空格后的小写文本比较。
-func normQty(s string) string {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return ""
-	}
-	clean := strings.ReplaceAll(s, ",", "")
-	if f, err := strconv.ParseFloat(clean, 64); err == nil {
-		return strconv.FormatFloat(f, 'f', -1, 64)
-	}
-	return strings.ToLower(s)
+func makeKey(a, e string) string {
+	return fmt.Sprintf("%s|%s", strings.TrimSpace(a), strings.TrimSpace(e))
 }
 
-// matchKey 料号(A列) + 数量(E列) 共同构成匹配键。
-func (r bomRow) matchKey() string {
-	return strings.TrimSpace(r.cells[0]) + "\x1f" + normQty(r.cells[4])
-}
-
-// readBOM 读取 BOM 的第一个工作表：返回表头行与 A~F 的有效数据行（跳过整行空白）。
-func readBOM(path string) (bomRow, []bomRow, error) {
-	var header bomRow
+func readBOM(path string) ([]BomRow, error) {
 	f, err := excelize.OpenFile(path)
 	if err != nil {
-		return header, nil, fmt.Errorf("无法打开文件 %s：%v", filepath.Base(path), err)
+		return nil, err
 	}
 	defer f.Close()
 
-	sheets := f.GetSheetList()
-	if len(sheets) == 0 {
-		return header, nil, fmt.Errorf("文件 %s 中没有工作表", filepath.Base(path))
-	}
-
-	rows, err := f.GetRows(sheets[0])
+	sheet := f.GetSheetList()[0]
+	rows, err := f.GetRows(sheet)
 	if err != nil {
-		return header, nil, fmt.Errorf("读取 %s 出错：%v", filepath.Base(path), err)
+		return nil, err
 	}
 
-	if len(rows) == 0 {
-		return header, nil, fmt.Errorf("文件 %s 是空表，缺少表头", filepath.Base(path))
+	var list []BomRow
+	// 跳过第一行表头，从第2行开始读数据
+	for i := 1; i < len(rows); i++ {
+		r := rows[i]
+		a := getCell(r, 0)
+		b := getCell(r, 1)
+		c := getCell(r, 2)
+		d := getCell(r, 3)
+		e := getCell(r, 4)
+		ff := getCell(r, 5)
+		key := makeKey(a, e)
+		list = append(list, BomRow{
+			ColA: a, ColB: b, ColC: c, ColD: d, ColE: e, ColF: ff, Key: key,
+		})
 	}
-	for i := 0; i < colCount && i < len(rows[0]); i++ {
-		header.cells[i] = strings.TrimSpace(rows[0][i])
-	}
-
-	var data []bomRow
-	for i := 1; i < len(rows); i++ { // 跳过表头
-		var r bomRow
-		for c := 0; c < colCount && c < len(rows[i]); c++ {
-			r.cells[c] = strings.TrimSpace(rows[i][c])
-		}
-		if r.isEmpty() {
-			continue // 整行空白不参与比较
-		}
-		data = append(data, r)
-	}
-	return header, data, nil
+	return list, nil
 }
 
-// pickInputs 决定要比较的两个文件：优先使用命令行参数，否则自动扫描当前文件夹里的 xlsx。
-func pickInputs(args []string) (string, string, error) {
-	if len(args) == 2 {
-		return args[0], args[1], nil
+func getCell(row []string, idx int) string {
+	if idx >= len(row) {
+		return ""
 	}
-	if len(args) > 0 && len(args) != 2 {
-		return "", "", fmt.Errorf("需要 2 个文件，实际给了 %d 个。用法：bom-compare.exe [BOM1.xlsx BOM2.xlsx]", len(args))
-	}
-
-	files, err := filepath.Glob("*.xlsx")
-	if err != nil {
-		return "", "", fmt.Errorf("扫描当前文件夹失败：%v", err)
-	}
-	var cands []string
-	for _, p := range files {
-		if strings.HasPrefix(filepath.Base(p), "~$") { // 跳过 Excel 打开时产生的临时文件
-			continue
-		}
-		if strings.EqualFold(filepath.Base(p), outputName) {
-			continue // 跳过上一次的结果文件
-		}
-		cands = append(cands, p)
-	}
-	sort.Strings(cands)
-
-	if len(cands) != 2 {
-		if len(cands) == 0 {
-			return "", "", fmt.Errorf("当前文件夹里没有找到 xlsx 文件")
-		}
-		return "", "", fmt.Errorf("当前文件夹里有 %d 个 xlsx 文件（%s），请用命令行参数指定要比较的两个，例如：bom-compare.exe BOM1.xlsx BOM2.xlsx",
-			len(cands), strings.Join(baseNames(cands), "、"))
-	}
-	return cands[0], cands[1], nil
-}
-
-func baseNames(paths []string) []string {
-	out := make([]string, len(paths))
-	for i, p := range paths {
-		out[i] = filepath.Base(p)
-	}
-	return out
+	return strings.TrimSpace(row[idx])
 }
 
 func main() {
-	exitCode := run()
-	os.Exit(exitCode)
-}
+	enableUTF8Console()
+	args := os.Args[1:]
+	var file1, file2 string
+	dir, _ := os.Getwd()
 
-func run() int {
-	defer enableUTF8Console()()
+	if len(args) >= 2 {
+		file1 = args[0]
+		file2 = args[1]
+	} else {
+		// 自动查找当前目录xlsx，排除对比结果.xlsx 和临时文件
+		var xlsxFiles []string
+		_ = filepath.Walk(dir, func(p string, info os.FileInfo, err error) error {
+			if err != nil {
+				return nil
+			}
+			if info.IsDir() {
+				return nil
+			}
+			name := info.Name()
+			if strings.HasSuffix(strings.ToLower(name), ".xlsx") {
+				if name == "对比结果.xlsx" || strings.HasPrefix(name, "~$") {
+					return nil
+				}
+				xlsxFiles = append(xlsxFiles, p)
+			}
+			return nil
+		})
+		if len(xlsxFiles) < 2 {
+			fmt.Println("错误：当前目录需要至少2个xlsx BOM文件，或者手动传入参数 bom-compare.exe 1.xlsx 2.xlsx")
+			os.Exit(1)
+		}
+		file1 = xlsxFiles[0]
+		file2 = xlsxFiles[1]
+	}
 
-	p1, p2, err := pickInputs(os.Args[1:])
+	// 读取两个BOM
+	list1, err := readBOM(file1)
 	if err != nil {
-		fmt.Println("错误：" + err.Error())
-		return 2
+		fmt.Printf("读取%s失败：%v\n", file1, err)
+		os.Exit(1)
 	}
-
-	header1, data1, err := readBOM(p1)
+	list2, err := readBOM(file2)
 	if err != nil {
-		fmt.Println("错误：" + err.Error())
-		return 1
-	}
-	header2, data2, err := readBOM(p2)
-	if err != nil {
-		fmt.Println("错误：" + err.Error())
-		return 1
+		fmt.Printf("读取%s失败：%v\n", file2, err)
+		os.Exit(1)
 	}
 
-	fmt.Printf("第1个BOM：%s（数据 %d 行）\n", filepath.Base(p1), len(data1))
-	fmt.Printf("第2个BOM：%s（数据 %d 行）\n", filepath.Base(p2), len(data2))
+	name1 := filepath.Base(file1)
+	name2 := filepath.Base(file2)
 
-	// 按「料号+数量」为第2个BOM建索引；同键重复时按出现顺序先进先出配对。
-	idx2 := make(map[string][]int, len(data2))
-	for i := range data2 {
-		k := data2[i].matchKey()
-		idx2[k] = append(idx2[k], i)
+	// 建立list2 key -> 剩余行索引
+	type idxWrap struct {
+		used bool
+		row  BomRow
+	}
+	map2 := make(map[string][]*idxWrap)
+	for _, r := range list2 {
+		map2[r.Key] = append(map2[r.Key], &idxWrap{used: false, row: r})
 	}
 
-	used2 := make([]bool, len(data2))
-	type pair struct{ i1, i2 int }
-	var matched []pair
-	var only1, only2 []int
+	var common []struct{ r1, r2 BomRow }
+	var only1 []BomRow
+	var only2 []BomRow
 
-	for i := range data1 {
-		k := data1[i].matchKey()
-		q := idx2[k]
-		if len(q) > 0 {
-			j := q[0]
-			idx2[k] = q[1:]
-			used2[j] = true
-			matched = append(matched, pair{i, j})
-		} else {
-			only1 = append(only1, i)
+	// 匹配共有物料
+	for _, r1 := range list1 {
+		found := false
+		if arr, ok := map2[r1.Key]; ok {
+			for _, item := range arr {
+				if !item.used {
+					common = append(common, struct{ r1, r2 BomRow }{r1, item.row})
+					item.used = true
+					found = true
+					break
+				}
+			}
+		}
+		if !found {
+			only1 = append(only1, r1)
 		}
 	}
-	for j := range data2 {
-		if !used2[j] {
-			only2 = append(only2, j)
-		}
-	}
-
-	// 每次运行都重建结果文件：先删旧的。
-	if err := os.Remove(outputName); err != nil && !os.IsNotExist(err) {
-		fmt.Printf("错误：无法删除已存在的 %s（可能正被 Excel 打开）：%v\n", outputName, err)
-		return 1
-	}
-
-	f := excelize.NewFile()
-	defer f.Close()
-	sheet := "对比结果"
-	f.SetSheetName("Sheet1", sheet)
-
-	writeRow := func(rowNum int, startCol int, r bomRow) {
-		for c := 0; c < colCount; c++ {
-			if v := r.cells[c]; v != "" {
-				cell, _ := excelize.CoordinatesToCellName(startCol+c, rowNum)
-				f.SetCellStr(sheet, cell, v)
+	// 收集list2剩下没匹配上的，属于only2
+	for _, arr := range map2 {
+		for _, item := range arr {
+			if !item.used {
+				only2 = append(only2, item.row)
 			}
 		}
 	}
 
-	// 第1行：两个 BOM 的文件名；第2行：表头。
-	f.SetCellStr(sheet, "A1", filepath.Base(p1))
-	f.SetCellStr(sheet, "G1", filepath.Base(p2))
-	writeRow(2, 1, header1)
-	h2 := header2
-	for c := 0; c < colCount; c++ {
-		if h2.cells[c] == "" {
-			h2.cells[c] = header1.cells[c] // 第2个BOM表头缺失时沿用第1个
-		}
-	}
-	writeRow(2, 7, h2)
+	// 删除旧结果文件
+	outName := "对比结果.xlsx"
+	_ = os.Remove(outName)
 
-	rowNum := firstCell
-	for _, p := range matched {
-		writeRow(rowNum, 1, data1[p.i1])
-		writeRow(rowNum, 7, data2[p.i2])
-		f.SetCellStr(sheet, fmt.Sprintf("M%d", rowNum), "共有物料")
-		rowNum++
-	}
-	for _, i := range only1 {
-		writeRow(rowNum, 1, data1[i])
-		f.SetCellStr(sheet, fmt.Sprintf("M%d", rowNum), "第1个BOM特有物料")
-		rowNum++
-	}
-	for _, j := range only2 {
-		writeRow(rowNum, 7, data2[j])
-		f.SetCellStr(sheet, fmt.Sprintf("M%d", rowNum), "第2个BOM特有物料")
-		rowNum++
+	f := excelize.NewFile()
+	sheet := "Sheet1"
+	f.SetSheetName("Sheet1", sheet)
+
+	// A1=文件1名，G1=文件2名
+	f.SetCellValue(sheet, "A1", name1)
+	f.SetCellValue(sheet, "G1", name2)
+
+	// 第2行表头 A-F / G-L
+	headers := []string{"料号", "B", "C", "D", "数量", "F", "料号", "B", "C", "D", "数量", "F", "类型"}
+	for colIdx, h := range headers {
+		cell, _ := excelize.CoordinatesToCellName(colIdx+1, 2)
+		f.SetCellValue(sheet, cell, h)
 	}
 
-	styleSheet(f, sheet, rowNum-1)
-
-	// 保存：覆盖为新文件。
-	if err := f.SaveAs(outputName); err != nil {
-		fmt.Printf("错误：保存 %s 失败：%v\n", outputName, err)
-		return 1
+	row := 3 // 数据从第3行开始
+	// 写入共有物料
+	for _, item := range common {
+		writeRow(f, sheet, row, item.r1, item.r2, "共有物料")
+		row++
+	}
+	// 写入BOM1特有
+	for _, r := range only1 {
+		writeRow(f, sheet, row, r, BomRow{}, "第1个BOM特有物料")
+		row++
+	}
+	// 写入BOM2特有
+	for _, r := range only2 {
+		writeRow(f, sheet, row, BomRow{}, r, "第2个BOM特有物料")
+		row++
 	}
 
-	fmt.Println()
-	fmt.Printf("完成：共有物料 %d 行，第1个BOM特有 %d 行，第2个BOM特有 %d 行。\n", len(matched), len(only1), len(only2))
-	fmt.Printf("结果已写入：%s（当前文件夹）\n", outputName)
-	return 0
+	if err := f.SaveAs(outName); err != nil {
+		fmt.Printf("保存对比结果.xlsx失败，请关闭打开的Excel！err:%v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("对比完成！输出文件：%s\n", outName)
 }
 
-// styleSheet 做基础排版：表头加粗居中、灰底、设列宽、冻结前两行。
-func styleSheet(f *excelize.File, sheet string, lastRow int) {
-	headerStyle, _ := f.NewStyle(&excelize.Style{
-		Font:      &excelize.Font{Bold: true},
-		Alignment: &excelize.Alignment{Horizontal: "center", Vertical: "center"},
-		Fill:      excelize.Fill{Type: "pattern", Pattern: 1, Color: []string{"F2F2F2"}},
-	})
-	labelStyle, _ := f.NewStyle(&excelize.Style{
-		Alignment: &excelize.Alignment{Horizontal: "center", Vertical: "center"},
-	})
-	f.SetCellStyle(sheet, "A1", "M2", headerStyle)
-	if lastRow >= 3 {
-		f.SetCellStyle(sheet, "M3", fmt.Sprintf("M%d", lastRow), labelStyle)
-	}
+func writeRow(f *excelize.File, sheet string, row int, r1, r2 BomRow, typ string) {
+	// A-F r1
+	f.SetCellValue(sheet, fmt.Sprintf("A%d", row), r1.ColA)
+	f.SetCellValue(sheet, fmt.Sprintf("B%d", row), r1.ColB)
+	f.SetCellValue(sheet, fmt.Sprintf("C%d", row), r1.ColC)
+	f.SetCellValue(sheet, fmt.Sprintf("D%d", row), r1.ColD)
+	f.SetCellValue(sheet, fmt.Sprintf("E%d", row), r1.ColE)
+	f.SetCellValue(sheet, fmt.Sprintf("F%d", row), r1.ColF)
 
-	f.SetColWidth(sheet, "A", "A", 18)
-	f.SetColWidth(sheet, "B", "F", 14)
-	f.SetColWidth(sheet, "G", "G", 18)
-	f.SetColWidth(sheet, "H", "L", 14)
-	f.SetColWidth(sheet, "M", "M", 20)
+	// G-L r2
+	f.SetCellValue(sheet, fmt.Sprintf("G%d", row), r2.ColA)
+	f.SetCellValue(sheet, fmt.Sprintf("H%d", row), r2.ColB)
+	f.SetCellValue(sheet, fmt.Sprintf("I%d", row), r2.ColC)
+	f.SetCellValue(sheet, fmt.Sprintf("J%d", row), r2.ColD)
+	f.SetCellValue(sheet, fmt.Sprintf("K%d", row), r2.ColE)
+	f.SetCellValue(sheet, fmt.Sprintf("L%d", row), r2.ColF)
 
-	f.SetPanes(sheet, &excelize.Panes{
-		Freeze:      true,
-		YSplit:      2,
-		TopLeftCell: "A3",
-		ActivePane:  "bottomLeft",
-	})
+	// M列类型
+	f.SetCellValue(sheet, fmt.Sprintf("M%d", row), typ)
 }
-//（注：内容由AI生成）
