@@ -255,7 +255,7 @@ func main() {
 		fmt.Printf("保存对比结果.xlsx失败，请关闭打开的Excel！err:%v\n", err)
 			fmt.Print("按回车键退出...")
 	_, _ = os.Stdin.Read(make([]byte, 1))
-		'os.Exit(1)
+		//os.Exit(1)
 	}
 
 	fmt.Println("已经对比完成，对比结果请查收当前文件夹中的对比结果.xlsx")
