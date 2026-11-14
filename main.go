@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -28,9 +29,12 @@ type BomRow struct {
 	ColB string
 	ColC string
 	ColD string
-	ColE string
-	ColF string
+	ColE string //数量
+	ColF string //位号
 }
+
+// PriceMap 料号 -> 含税单价
+var priceMap map[string]float64
 
 func parseQty(s string) float64 {
 	s = strings.TrimSpace(s)
@@ -41,25 +45,97 @@ func parseQty(s string) float64 {
 	return f
 }
 
+// 读取价格总表.xlsx，A列料号，C列含税单价
+func loadPriceTable() error {
+	priceMap = make(map[string]float64)
+	priceFile := "价格总表.xlsx"
+	if _, err := os.Stat(priceFile); err != nil {
+		// 文件不存在，不报错，只是所有料号都查不到价格
+		return nil
+	}
+	f, err := excelize.OpenFile(priceFile)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	sheets := f.GetSheetList()
+	if len(sheets) == 0 {
+		return nil
+	}
+	rows, err := f.GetRows(sheets[0])
+	if err != nil {
+		return err
+	}
+	for i := 1; i < len(rows); i++ {
+		r := rows[i]
+		pn := getCell(r, 0)
+		priceStr := getCell(r, 2)
+		pn = strings.TrimSpace(pn)
+		if pn == "" {
+			continue
+		}
+		pr := parseQty(priceStr)
+		priceMap[pn] = pr
+	}
+	return nil
+}
+
+func getPrice(pn string) (float64, bool) {
+	pn = strings.TrimSpace(pn)
+	v, ok := priceMap[pn]
+	return v, ok
+}
+
+// readBOM 增强：跳过合并单元格非首行（E、F列合并区域）
 func readBOM(path string) ([]BomRow, error) {
 	f, err := excelize.OpenFile(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-
 	sheets := f.GetSheetList()
 	if len(sheets) == 0 {
 		return nil, fmt.Errorf("文件无工作表")
 	}
 	sheet := sheets[0]
+
+	// 获取所有合并单元格
+	mergeRanges, err := f.GetMergeCells(sheet)
+	if err != nil {
+		return nil, err
+	}
+	// key: 行号（从0开始）, value:true 代表这一行属于某个合并区域，但不是首行，需要跳过
+	skipRow := make(map[int]bool)
+	for _, mr := range mergeRanges {
+		startCol, startRow, endCol, endRow, err := excelize.CellNameToCoordinates(mr)
+		if err != nil {
+			continue
+		}
+		// Excel坐标是从1开始，转为程序内0基
+		sR := startRow - 1
+		eR := endRow - 1
+		sC := startCol
+		eC := endCol
+		// 判断这个合并区域是否包含E(5)或者F(6)列
+		hasE := (sC <= 5 && eC >= 5)
+		hasF := (sC <= 6 && eC >= 6)
+		if hasE || hasF {
+			// 合并区内，除首行外全部标记跳过
+			for r := sR + 1; r <= eR; r++ {
+				skipRow[r] = true
+			}
+		}
+	}
+
 	rows, err := f.GetRows(sheet)
 	if err != nil {
 		return nil, err
 	}
-
 	var list []BomRow
 	for i := 1; i < len(rows); i++ {
+		if skipRow[i] {
+			continue
+		}
 		r := rows[i]
 		a := getCell(r, 0)
 		b := getCell(r, 1)
@@ -81,8 +157,54 @@ func getCell(row []string, idx int) string {
 	return strings.TrimSpace(row[idx])
 }
 
+type WriteRowData struct {
+	r1  BomRow
+	r2  BomRow
+	typ string
+}
+
+// sortGroup：一组WriteRowData，内部排序：查到价格在前，无价格在后
+func sortGroup(list []WriteRowData) []WriteRowData {
+	out := make([]WriteRowData, 0, len(list))
+	hasPrice := make([]WriteRowData, 0)
+	noPrice := make([]WriteRowData, 0)
+	for _, d := range list {
+		// 判断规则：只要r1料号查到 或者 r2料号查到，不算无价格？
+		// 需求：该行【对应的】料号查不到就标记无价格
+		// 共有物料：看r1料号；BOM1特有：r1料号；BOM2特有：r2料号
+		no := false
+		switch d.typ {
+		case "共有物料", "第1个BOM特有物料":
+			_, ok := getPrice(d.r1.ColA)
+			if !ok {
+				no = true
+			}
+		case "第2个BOM特有物料":
+			_, ok := getPrice(d.r2.ColA)
+			if !ok {
+				no = true
+			}
+		}
+		if no {
+			noPrice = append(noPrice, d)
+		} else {
+			hasPrice = append(hasPrice, d)
+		}
+	}
+	out = append(out, hasPrice...)
+	out = append(out, noPrice...)
+	return out
+}
+
 func main() {
 	enableUTF8Console()
+	// 加载价格表
+	if err := loadPriceTable(); err != nil {
+		fmt.Printf("读取价格总表.xlsx异常：%v\n", err)
+		waitEnter()
+		os.Exit(1)
+	}
+
 	args := os.Args[1:]
 	var file1, file2 string
 	dir, _ := os.Getwd()
@@ -102,7 +224,7 @@ func main() {
 			name := info.Name()
 			lower := strings.ToLower(name)
 			if strings.HasSuffix(lower, ".xlsx") {
-				if name == "对比结果.xlsx" || strings.HasPrefix(name, "~$") {
+				if name == "对比结果.xlsx" || name == "价格总表.xlsx" || strings.HasPrefix(name, "~$") {
 					return nil
 				}
 				xlsxFiles = append(xlsxFiles, p)
@@ -183,11 +305,6 @@ func main() {
 		}
 	}
 
-	type WriteRowData struct {
-		r1  BomRow
-		r2  BomRow
-		typ string
-	}
 	var commonList []WriteRowData
 	var bom1ExtraList []WriteRowData
 	var bom2ExtraList []WriteRowData
@@ -226,6 +343,11 @@ func main() {
 		bom2ExtraList = append(bom2ExtraList, WriteRowData{BomRow{}, r, "第2个BOM特有物料"})
 	}
 
+	// 每组内部排序：有价格在前，无价格在后
+	commonList = sortGroup(commonList)
+	bom1ExtraList = sortGroup(bom1ExtraList)
+	bom2ExtraList = sortGroup(bom2ExtraList)
+
 	outName := "对比结果.xlsx"
 	_ = os.Remove(outName)
 	f := excelize.NewFile()
@@ -233,9 +355,16 @@ func main() {
 	f.SetSheetName("Sheet1", sheet)
 
 	f.SetCellValue(sheet, "A1", name1)
-	f.SetCellValue(sheet, "G1", name2)
+	f.SetCellValue(sheet, "I1", name2)
 
-	headers := []string{"料号", "B", "C", "D", "数量", "F", "料号", "B", "C", "D", "数量", "F", "类型"}
+	// 新表头！
+	headers := []string{
+		"料号", "B", "C", "D", "数量", "F",
+		"单价", "总价",
+		"料号", "B", "C", "D", "数量", "F",
+		"单价", "总价",
+		"类型",
+	}
 	for colIdx, h := range headers {
 		cell, _ := excelize.CoordinatesToCellName(colIdx+1, 2)
 		f.SetCellValue(sheet, cell, h)
@@ -243,15 +372,15 @@ func main() {
 
 	row := 3
 	for _, d := range commonList {
-		writeRow(f, sheet, row, d.r1, d.r2, d.typ)
+		writeRowNew(f, sheet, row, d.r1, d.r2, d.typ)
 		row++
 	}
 	for _, d := range bom1ExtraList {
-		writeRow(f, sheet, row, d.r1, d.r2, d.typ)
+		writeRowNew(f, sheet, row, d.r1, d.r2, d.typ)
 		row++
 	}
 	for _, d := range bom2ExtraList {
-		writeRow(f, sheet, row, d.r1, d.r2, d.typ)
+		writeRowNew(f, sheet, row, d.r1, d.r2, d.typ)
 		row++
 	}
 
@@ -265,13 +394,9 @@ func main() {
 	waitEnter()
 }
 
-func waitEnter() {
-	fmt.Println("按回车键退出...")
-	scanner := bufio.NewScanner(os.Stdin)
-	scanner.Scan()
-}
-
-func writeRow(f *excelize.File, sheet string, row int, r1, r2 BomRow, typ string) {
+// writeRowNew 新版写入，支持单价总价
+func writeRowNew(f *excelize.File, sheet string, row int, r1, r2 BomRow, typ string) {
+	// A-F：BOM1基础
 	f.SetCellValue(sheet, fmt.Sprintf("A%d", row), r1.ColA)
 	f.SetCellValue(sheet, fmt.Sprintf("B%d", row), r1.ColB)
 	f.SetCellValue(sheet, fmt.Sprintf("C%d", row), r1.ColC)
@@ -279,12 +404,42 @@ func writeRow(f *excelize.File, sheet string, row int, r1, r2 BomRow, typ string
 	f.SetCellValue(sheet, fmt.Sprintf("E%d", row), r1.ColE)
 	f.SetCellValue(sheet, fmt.Sprintf("F%d", row), r1.ColF)
 
-	f.SetCellValue(sheet, fmt.Sprintf("G%d", row), r2.ColA)
-	f.SetCellValue(sheet, fmt.Sprintf("H%d", row), r2.ColB)
-	f.SetCellValue(sheet, fmt.Sprintf("I%d", row), r2.ColC)
-	f.SetCellValue(sheet, fmt.Sprintf("J%d", row), r2.ColD)
-	f.SetCellValue(sheet, fmt.Sprintf("K%d", row), r2.ColE)
-	f.SetCellValue(sheet, fmt.Sprintf("L%d", row), r2.ColF)
+	// G H：BOM1单价、总价
+	p1, ok1 := getPrice(r1.ColA)
+	q1 := parseQty(r1.ColE)
+	if ok1 {
+		f.SetCellValue(sheet, fmt.Sprintf("G%d", row), p1)
+		f.SetCellValue(sheet, fmt.Sprintf("H%d", row), p1*q1)
+	} else {
+		f.SetCellValue(sheet, fmt.Sprintf("G%d", row), "价格不存在")
+		f.SetCellValue(sheet, fmt.Sprintf("H%d", row), "价格不存在")
+	}
 
-	f.SetCellValue(sheet, fmt.Sprintf("M%d", row), typ)
+	// I-N：BOM2基础
+	f.SetCellValue(sheet, fmt.Sprintf("I%d", row), r2.ColA)
+	f.SetCellValue(sheet, fmt.Sprintf("J%d", row), r2.ColB)
+	f.SetCellValue(sheet, fmt.Sprintf("K%d", row), r2.ColC)
+	f.SetCellValue(sheet, fmt.Sprintf("L%d", row), r2.ColD)
+	f.SetCellValue(sheet, fmt.Sprintf("M%d", row), r2.ColE)
+	f.SetCellValue(sheet, fmt.Sprintf("N%d", row), r2.ColF)
+
+	// O P：BOM2单价、总价
+	p2, ok2 := getPrice(r2.ColA)
+	q2 := parseQty(r2.ColE)
+	if ok2 {
+		f.SetCellValue(sheet, fmt.Sprintf("O%d", row), p2)
+		f.SetCellValue(sheet, fmt.Sprintf("P%d", row), p2*q2)
+	} else {
+		f.SetCellValue(sheet, fmt.Sprintf("O%d", row), "价格不存在")
+		f.SetCellValue(sheet, fmt.Sprintf("P%d", row), "价格不存在")
+	}
+
+	// Q 类型
+	f.SetCellValue(sheet, fmt.Sprintf("Q%d", row), typ)
+}
+
+func waitEnter() {
+	fmt.Println("按回车键退出...")
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Scan()
 }
