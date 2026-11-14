@@ -2,8 +2,10 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -25,13 +27,18 @@ type BomRow struct {
 	ColB string
 	ColC string
 	ColD string
-	ColE string // 数量
+	ColE string // 数量文本
 	ColF string
-	Key  string // A料号+E数量 作为匹配key
 }
 
-func makeKey(a, e string) string {
-	return fmt.Sprintf("%s|%s", strings.TrimSpace(a), strings.TrimSpace(e))
+// 把数量字符串转float，失败返回0
+func parseQty(s string) float64 {
+	s = strings.TrimSpace(s)
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0
+	}
+	return f
 }
 
 func readBOM(path string) ([]BomRow, error) {
@@ -41,14 +48,18 @@ func readBOM(path string) ([]BomRow, error) {
 	}
 	defer f.Close()
 
-	sheet := f.GetSheetList()[0]
+	sheets := f.GetSheetList()
+	if len(sheets) == 0 {
+		return nil, fmt.Errorf("文件无工作表")
+	}
+	sheet := sheets[0]
 	rows, err := f.GetRows(sheet)
 	if err != nil {
 		return nil, err
 	}
 
 	var list []BomRow
-	// 跳过第一行表头，从第2行开始读数据
+	// 跳过表头第1行，从第2行开始读数据
 	for i := 1; i < len(rows); i++ {
 		r := rows[i]
 		a := getCell(r, 0)
@@ -57,9 +68,8 @@ func readBOM(path string) ([]BomRow, error) {
 		d := getCell(r, 3)
 		e := getCell(r, 4)
 		ff := getCell(r, 5)
-		key := makeKey(a, e)
 		list = append(list, BomRow{
-			ColA: a, ColB: b, ColC: c, ColD: d, ColE: e, ColF: ff, Key: key,
+			ColA: a, ColB: b, ColC: c, ColD: d, ColE: e, ColF: ff,
 		})
 	}
 	return list, nil
@@ -82,7 +92,6 @@ func main() {
 		file1 = args[0]
 		file2 = args[1]
 	} else {
-		// 自动查找当前目录xlsx，排除对比结果.xlsx 和临时文件
 		var xlsxFiles []string
 		_ = filepath.Walk(dir, func(p string, info os.FileInfo, err error) error {
 			if err != nil {
@@ -92,7 +101,8 @@ func main() {
 				return nil
 			}
 			name := info.Name()
-			if strings.HasSuffix(strings.ToLower(name), ".xlsx") {
+			lower := strings.ToLower(name)
+			if strings.HasSuffix(lower, ".xlsx") {
 				if name == "对比结果.xlsx" || strings.HasPrefix(name, "~$") {
 					return nil
 				}
@@ -108,7 +118,6 @@ func main() {
 		file2 = xlsxFiles[1]
 	}
 
-	// 读取两个BOM
 	list1, err := readBOM(file1)
 	if err != nil {
 		fmt.Printf("读取%s失败：%v\n", file1, err)
@@ -123,77 +132,117 @@ func main() {
 	name1 := filepath.Base(file1)
 	name2 := filepath.Base(file2)
 
-	// 建立list2 key -> 剩余行索引
-	type idxWrap struct {
+	// 构建BOM2：料号 -> 行列表，标记是否已匹配
+	type wrap struct {
 		used bool
 		row  BomRow
 	}
-	map2 := make(map[string][]*idxWrap)
+	map2 := make(map[string][]*wrap)
 	for _, r := range list2 {
-		map2[r.Key] = append(map2[r.Key], &idxWrap{used: false, row: r})
+		pn := strings.TrimSpace(r.ColA)
+		map2[pn] = append(map2[pn], &wrap{used: false, row: r})
 	}
 
-	var common []struct{ r1, r2 BomRow }
-	var only1 []BomRow
-	var only2 []BomRow
+	var only1 []BomRow   // BOM1 料号在BOM2找不到
+	var only2 []BomRow   // BOM2 剩余没匹配的
+	type pair struct {
+		r1 BomRow
+		r2 BomRow
+	}
+	var commonPairs []pair
 
-	// 匹配共有物料
+	// 第一步：匹配料号相同的行
 	for _, r1 := range list1 {
-		found := false
-		if arr, ok := map2[r1.Key]; ok {
-			for _, item := range arr {
-				if !item.used {
-					common = append(common, struct{ r1, r2 BomRow }{r1, item.row})
-					item.used = true
-					found = true
-					break
-				}
+		pn1 := strings.TrimSpace(r1.ColA)
+		arr, ok := map2[pn1]
+		if !ok {
+			// 料号不存在，归入BOM1特有
+			only1 = append(only1, r1)
+			continue
+		}
+		// 找到第一个未使用的同料号行
+		foundIdx := -1
+		for i, item := range arr {
+			if !item.used {
+				foundIdx = i
+				break
 			}
 		}
-		if !found {
+		if foundIdx == -1 {
 			only1 = append(only1, r1)
+			continue
 		}
+		item := arr[foundIdx]
+		item.used = true
+		commonPairs = append(commonPairs, pair{r1, item.row})
 	}
-	// 收集list2剩下没匹配上的，属于only2
+
+	// 收集BOM2里面剩下没匹配的
 	for _, arr := range map2 {
-		for _, item := range arr {
-			if !item.used {
-				only2 = append(only2, item.row)
+		for _, w := range arr {
+			if !w.used {
+				only2 = append(only2, w.row)
 			}
 		}
 	}
 
-	// 删除旧结果文件
 	outName := "对比结果.xlsx"
 	_ = os.Remove(outName)
-
 	f := excelize.NewFile()
 	sheet := "Sheet1"
 	f.SetSheetName("Sheet1", sheet)
 
-	// A1=文件1名，G1=文件2名
 	f.SetCellValue(sheet, "A1", name1)
 	f.SetCellValue(sheet, "G1", name2)
 
-	// 第2行表头 A-F / G-L
 	headers := []string{"料号", "B", "C", "D", "数量", "F", "料号", "B", "C", "D", "数量", "F", "类型"}
 	for colIdx, h := range headers {
 		cell, _ := excelize.CoordinatesToCellName(colIdx+1, 2)
 		f.SetCellValue(sheet, cell, h)
 	}
 
-	row := 3 // 数据从第3行开始
-	// 写入共有物料
-	for _, item := range common {
-		writeRow(f, sheet, row, item.r1, item.r2, "共有物料")
+	row := 3
+	// 处理【料号相同】的配对：生成共有行 + 差值特有行
+	for _, p := range commonPairs {
+		r1 := p.r1
+		r2 := p.r2
+		q1 := parseQty(r1.ColE)
+		q2 := parseQty(r2.ColE)
+		minQty := math.Min(q1, q2)
+		diff := math.Abs(q1 - q2)
+
+		// 共有物料行：数量改为minQty
+		sharedR1 := r1
+		sharedR1.ColE = fmt.Sprintf("%g", minQty)
+		sharedR2 := r2
+		sharedR2.ColE = fmt.Sprintf("%g", minQty)
+		writeRow(f, sheet, row, sharedR1, sharedR2, "共有物料")
 		row++
+
+		// 存在差值，追加差异行
+		if diff > 1e-9 {
+			if q1 > q2 {
+				// BOM1多出来的数量，追加到BOM1特有
+				diffRow := r1
+				diffRow.ColE = fmt.Sprintf("%g", diff)
+				writeRow(f, sheet, row, diffRow, BomRow{}, "第1个BOM特有物料")
+				row++
+			} else {
+				// BOM2多出来的数量，追加到BOM2特有
+				diffRow := r2
+				diffRow.ColE = fmt.Sprintf("%g", diff)
+				writeRow(f, sheet, row, BomRow{}, diffRow, "第2个BOM特有物料")
+				row++
+			}
+		}
 	}
-	// 写入BOM1特有
+
+	// 写入BOM1完全找不到对应料号的行
 	for _, r := range only1 {
 		writeRow(f, sheet, row, r, BomRow{}, "第1个BOM特有物料")
 		row++
 	}
-	// 写入BOM2特有
+	// 写入BOM2完全找不到对应料号的行
 	for _, r := range only2 {
 		writeRow(f, sheet, row, BomRow{}, r, "第2个BOM特有物料")
 		row++
@@ -203,11 +252,12 @@ func main() {
 		fmt.Printf("保存对比结果.xlsx失败，请关闭打开的Excel！err:%v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("对比完成！输出文件：%s\n", outName)
+
+	// 固定输出文字
+	fmt.Println("已经对比完成，对比结果请查收当前文件夹中的对比结果.xlsx")
 }
 
 func writeRow(f *excelize.File, sheet string, row int, r1, r2 BomRow, typ string) {
-	// A-F r1
 	f.SetCellValue(sheet, fmt.Sprintf("A%d", row), r1.ColA)
 	f.SetCellValue(sheet, fmt.Sprintf("B%d", row), r1.ColB)
 	f.SetCellValue(sheet, fmt.Sprintf("C%d", row), r1.ColC)
@@ -215,7 +265,6 @@ func writeRow(f *excelize.File, sheet string, row int, r1, r2 BomRow, typ string
 	f.SetCellValue(sheet, fmt.Sprintf("E%d", row), r1.ColE)
 	f.SetCellValue(sheet, fmt.Sprintf("F%d", row), r1.ColF)
 
-	// G-L r2
 	f.SetCellValue(sheet, fmt.Sprintf("G%d", row), r2.ColA)
 	f.SetCellValue(sheet, fmt.Sprintf("H%d", row), r2.ColB)
 	f.SetCellValue(sheet, fmt.Sprintf("I%d", row), r2.ColC)
@@ -223,6 +272,5 @@ func writeRow(f *excelize.File, sheet string, row int, r1, r2 BomRow, typ string
 	f.SetCellValue(sheet, fmt.Sprintf("K%d", row), r2.ColE)
 	f.SetCellValue(sheet, fmt.Sprintf("L%d", row), r2.ColF)
 
-	// M列类型
 	f.SetCellValue(sheet, fmt.Sprintf("M%d", row), typ)
 }
